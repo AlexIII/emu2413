@@ -35,6 +35,7 @@
   2004 04-10 : Version 0.61 -- Added YMF281B tone (defined by Chabin).
   2015 12-13 : Version 0.62 -- Changed own integer types to C99 stdint.h types.
   2016 09-06 : Version 0.63 -- Support per-channel output.
+  2019 11-11 : Version 0.63.1 -- Fixd critical bugs.
 
   References: 
     fmopl.c        -- 1999,2000 written by Tatsuyuki Satoh (MAME development).
@@ -66,8 +67,10 @@ static uint8_t default_inst[OPLL_TONE_NUM][(16 + 3) * 16] = {
   }
 };
 
-/* Size of Sintable ( 8 -- 18 can be used. 9 recommended.) */
-#define PG_BITS 9
+#define PI 3.14159265358979323846
+
+/* Size of Sintable ( 8 -- 18 can be used ) */
+#define PG_BITS 10
 #define PG_WIDTH (1<<PG_BITS)
 
 /* Phase increment counter */
@@ -185,7 +188,7 @@ static OPLL_PATCH default_patch[OPLL_TONE_NUM][(16 + 3) * 2];
 
 /* Definition of envelope mode */
 enum OPLL_EG_STATE 
-{ READY, ATTACK, DECAY, SUSHOLD, SUSTINE, RELEASE, SETTLE, FINISH };
+{ READY, ATTACK, DECAY, SUSHOLD, SUSTINE, RELEASE, DAMP, FINISH };
 
 /* Phase incr table for Attack */
 static uint32_t dphaseARTable[16][16];
@@ -537,8 +540,8 @@ calc_eg_dphase (OPLL_SLOT * slot)
     else
       return dphaseDRTable[7][slot->rks];
 
-  case SETTLE:
-    return dphaseDRTable[15][0];
+  case DAMP:
+    return dphaseDRTable[12][0];
 
   case FINISH:
     return 0;
@@ -580,18 +583,7 @@ calc_eg_dphase (OPLL_SLOT * slot)
 static inline void
 slotOn (OPLL_SLOT * slot)
 {
-  slot->eg_mode = ATTACK;
-  slot->eg_phase = 0;
-  slot->phase = 0;
-  UPDATE_EG(slot);
-}
-
-/* Slot key on without reseting the phase */
-static inline void
-slotOn2 (OPLL_SLOT * slot)
-{
-  slot->eg_mode = ATTACK;
-  slot->eg_phase = 0;
+  slot->eg_mode = DAMP;
   UPDATE_EG(slot);
 }
 
@@ -649,14 +641,14 @@ static inline void
 keyOn_HH (OPLL * opll)
 {
   if (!opll->slot_on_flag[SLOT_HH])
-    slotOn2 (MOD(opll,7));
+    slotOn (MOD(opll,7));
 }
 
 static inline void
 keyOn_CYM (OPLL * opll)
 {
   if (!opll->slot_on_flag[SLOT_CYM])
-    slotOn2 (CAR(opll,8));
+    slotOn (CAR(opll,8));
 }
 
 /* Drum key off */
@@ -788,6 +780,7 @@ update_rhythm_mode (OPLL * opll)
     opll->slot[SLOT_SD].eg_mode = FINISH;
     setSlotPatch (&opll->slot[SLOT_HH], &opll->patch[17 * 2 + 0]);
     setSlotPatch (&opll->slot[SLOT_SD], &opll->patch[17 * 2 + 1]);
+    setSlotVolume(&opll->slot[SLOT_HH], ((opll->reg[0x37] >> 4) & 15) << 2);
   }
 
   if (opll->patch_number[8] & 0x10)
@@ -808,6 +801,7 @@ update_rhythm_mode (OPLL * opll)
     opll->slot[SLOT_CYM].eg_mode = FINISH;
     setSlotPatch (&opll->slot[SLOT_TOM], &opll->patch[18 * 2 + 0]);
     setSlotPatch (&opll->slot[SLOT_CYM], &opll->patch[18 * 2 + 1]);
+    setSlotVolume(&opll->slot[SLOT_TOM], ((opll->reg[0x37] >> 4) & 15) << 2);
   }
 }
 
@@ -1082,7 +1076,7 @@ update_noise (OPLL * opll)
 
 /* EG */
 static void
-calc_envelope (OPLL_SLOT * slot, int32_t lfo)
+calc_envelope (OPLL_SLOT * slot, int32_t lfo, int master, OPLL_SLOT * slave_slot)
 {
 #define S2E(x) (SL2EG((int32_t)(x/SL_STEP))<<(EG_DP_BITS-EG_BITS))
 
@@ -1145,16 +1139,30 @@ calc_envelope (OPLL_SLOT * slot, int32_t lfo)
       slot->eg_mode = FINISH;
       egout = (1 << EG_BITS) - 1;
     }
+    if (slot->eg_mode == SUSTINE && slot->patch->EG == 1) 
+    {
+      slot->eg_mode = SUSHOLD;
+      UPDATE_EG (slot);
+    }
     break;
 
-  case SETTLE:
+  case DAMP:
     egout = HIGHBITS (slot->eg_phase, EG_DP_BITS - EG_BITS);
     slot->eg_phase += slot->eg_dphase;
     if (egout >= (1 << EG_BITS))
     {
-      slot->eg_mode = ATTACK;
-      egout = (1 << EG_BITS) - 1;
-      UPDATE_EG(slot);
+      if (master) {
+        slot->eg_mode = ATTACK;
+        slot->eg_phase = 0;
+        slot->phase = 0;
+        if (slave_slot) {
+          slave_slot->eg_mode = ATTACK;
+          slave_slot->eg_phase = 0;
+          slave_slot->phase = 0;
+          UPDATE_EG(slave_slot);
+        }
+        UPDATE_EG(slot);
+      }
     }
     break;
 
@@ -1241,10 +1249,10 @@ calc_slot_snare (OPLL_SLOT * slot, uint32_t noise)
   if(slot->egout>=(DB_MUTE-1))
     return 0;
   
-  if(BIT(slot->pgout,7))
-    return DB2LIN_TABLE[(noise?DB_POS(0.0):DB_POS(15.0))+slot->egout];
+  if(BIT(slot->pgout,PG_BITS-2))
+    return DB2LIN_TABLE[(noise?DB_POS(0.0):DB_POS(48.0))+slot->egout];
   else
-    return DB2LIN_TABLE[(noise?DB_NEG(0.0):DB_NEG(15.0))+slot->egout];
+    return DB2LIN_TABLE[(noise?DB_NEG(48.0):DB_NEG(0.0))+slot->egout];
 }
 
 /* 
@@ -1258,14 +1266,12 @@ calc_slot_cym (OPLL_SLOT * slot, uint32_t pgout_hh)
   if (slot->egout >= (DB_MUTE - 1)) 
     return 0;
   else if( 
-      /* the same as fmopl.c */
       ((BIT(pgout_hh,PG_BITS-8)^BIT(pgout_hh,PG_BITS-1))|BIT(pgout_hh,PG_BITS-7)) ^
-      /* different from fmopl.c */
-     (BIT(slot->pgout,PG_BITS-7)&!BIT(slot->pgout,PG_BITS-5))
+     (BIT(slot->pgout,PG_BITS-7)^BIT(slot->pgout,PG_BITS-5))
     )
-    dbout = DB_NEG(3.0);
+    dbout = DB_NEG(0.0);
   else
-    dbout = DB_POS(3.0);
+    dbout = DB_POS(0.0);
 
   return DB2LIN_TABLE[dbout + slot->egout];
 }
@@ -1281,23 +1287,21 @@ calc_slot_hat (OPLL_SLOT *slot, int32_t pgout_cym, uint32_t noise)
   if (slot->egout >= (DB_MUTE - 1)) 
     return 0;
   else if( 
-      /* the same as fmopl.c */
       ((BIT(slot->pgout,PG_BITS-8)^BIT(slot->pgout,PG_BITS-1))|BIT(slot->pgout,PG_BITS-7)) ^
-      /* different from fmopl.c */
-      (BIT(pgout_cym,PG_BITS-7)&!BIT(pgout_cym,PG_BITS-5))
+      (BIT(pgout_cym,PG_BITS-7)^BIT(pgout_cym,PG_BITS-5))
     )
   {
     if(noise)
-      dbout = DB_NEG(12.0);
+      dbout = DB_NEG(13.68);
     else
-      dbout = DB_NEG(24.0);
+      dbout = DB_NEG(0.56);
   }
   else
   {
     if(noise)
-      dbout = DB_POS(12.0);
+      dbout = DB_POS(13.68);
     else
-      dbout = DB_POS(24.0);
+      dbout = DB_POS(0.56);
   }
 
   return DB2LIN_TABLE[dbout + slot->egout];
@@ -1317,7 +1321,11 @@ update_output (OPLL * opll)
   for (i = 0; i < 18; i++)
   {
     calc_phase(&opll->slot[i],opll->lfo_pm);
-    calc_envelope(&opll->slot[i],opll->lfo_am);
+    if (14 <= i && (opll->reg[0xe] & 32)) {
+      calc_envelope(&opll->slot[i], opll->lfo_am, 1, NULL);
+    } else {
+      calc_envelope(&opll->slot[i], opll->lfo_am, i&1, &opll->slot[i-1]);
+    }
   }
 
   /* CH1-6 */

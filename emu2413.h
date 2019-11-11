@@ -7,8 +7,6 @@
 extern "C" {
 #endif
 
-#define PI 3.14159265358979323846
-
 enum OPLL_TONE_ENUM {OPLL_2413_TONE=0, OPLL_VRC7_TONE=1, OPLL_281B_TONE=2} ;
 
 /* voice data */
@@ -133,6 +131,7 @@ void OPLL_getDefaultPatch(int32_t type, int32_t num, OPLL_PATCH *) ;
 /* Channel Mask */
 uint32_t OPLL_setMask(OPLL *, uint32_t mask) ;
 uint32_t OPLL_toggleMask(OPLL *, uint32_t mask) ;
+void OPLL_setChipMode(OPLL *, int mode);
 
 #ifdef __cplusplus
 }
